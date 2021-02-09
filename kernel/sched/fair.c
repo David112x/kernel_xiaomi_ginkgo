@@ -5404,7 +5404,11 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int task_new = !(flags & ENQUEUE_WAKEUP);
 	bool prefer_idle = sched_feat(EAS_PREFER_IDLE) ?
+#ifdef CONFIG_SCHED_TUNE
 				(schedtune_prefer_idle(p) > 0) : 0;
+#elif  CONFIG_UCLAMP_TASK
+				(uclamp_latency_sensitive(p) > 0) : 0;
+#endif
 	int idle_h_nr_running = idle_policy(p->policy);
 
 #ifdef CONFIG_SCHED_WALT
@@ -5952,6 +5956,33 @@ static unsigned long __cpu_norm_util(unsigned long util, unsigned long capacity)
 		return SCHED_CAPACITY_SCALE;
 
 	return (util << SCHED_CAPACITY_SHIFT)/capacity;
+}
+
+/*
+ * Check whether cpu is in the fastest set of cpu's that p should run on.
+ * If p is boosted, prefer that p runs on a faster cpu; otherwise, allow p
+ * to run on any cpu.
+ */
+static inline bool
+cpu_is_in_target_set(struct task_struct *p, int cpu)
+{
+	struct root_domain *rd = cpu_rq(cpu)->rd;
+	int first_cpu, next_usable_cpu;
+
+#ifdef CONFIG_SCHED_TUNE
+	if (schedtune_prefer_high_cap(p) && p->prio <= DEFAULT_PRIO) {
+#elif  CONFIG_UCLAMP_TASK
+	if (uclamp_boosted(p) && p->prio <= DEFAULT_PRIO) {
+#endif
+		first_cpu = rd->mid_cap_orig_cpu != -1 ? rd->mid_cap_orig_cpu :
+			    rd->max_cap_orig_cpu;
+
+	} else {
+		first_cpu = rd->min_cap_orig_cpu;
+	}
+
+	next_usable_cpu = cpumask_next(first_cpu - 1, &p->cpus_allowed);
+	return cpu >= next_usable_cpu || next_usable_cpu >= nr_cpu_ids;
 }
 
 static inline bool
@@ -7599,6 +7630,14 @@ static inline bool task_fits_max(struct task_struct *p, int cpu)
 		if (task_boost > 1)
 			return false;
 	}
+	if ((task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
+#ifdef CONFIG_SCHED_TUNE
+			schedtune_task_boost(p) > 0) &&
+#elif  CONFIG_UCLAMP_TASK
+			uclamp_boosted(p) > 0) &&
+#endif
+			is_min_capacity_cpu(cpu))
+		return false;
 
 	return task_fits_capacity(p, capacity, cpu);
 }
@@ -8145,8 +8184,7 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 	 */
 	if (target_cpu != -1 && !idle_cpu(target_cpu) &&
 			best_idle_cpu != -1) {
-		curr_tsk = READ_ONCE(cpu_rq(target_cpu)->curr);
-		if (curr_tsk && schedtune_task_boost_rcu_locked(curr_tsk)) {
+		curr_tsk = READ_ONCE(cpu_rq(target_cpu)->curr);{
 			target_cpu = best_idle_cpu;
 		}
 	}
@@ -8388,6 +8426,7 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 	int placement_boost = task_boost_policy(p);
 	u64 start_t = 0;
 	int next_cpu = -1, backup_cpu = -1;
+#ifdef CONFIG_SCHED_TUNE
 	int boosted = (schedtune_task_boost(p) > 0 || per_task_boost(p) > 0);
 	int start_cpu;
 
@@ -8402,6 +8441,9 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 	is_rtg = task_in_related_thread_group(p);
 	curr_is_rtg = task_in_related_thread_group(cpu_rq(cpu)->curr);
 
+#elif  CONFIG_UCLAMP_TASK
+	int boosted = (uclamp_boosted(p) > 0 || per_task_boost(p) > 0);
+#endif
 	fbt_env.fastpath = 0;
 	fbt_env.need_idle = need_idle;
 
@@ -8412,7 +8454,7 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 		sync = 0;
 
 	if (sysctl_sched_sync_hint_enable && sync &&
-				bias_to_this_cpu(p, cpu, start_cpu)) {
+				bias_to_this_cpu(p, cpu, cpu)) {
 		target_cpu = cpu;
 		fbt_env.fastpath = SYNC_WAKEUP;
 		goto out;
@@ -8464,13 +8506,15 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 		 * all if(prefer_idle) blocks.
 		 */
 		prefer_idle = sched_feat(EAS_PREFER_IDLE) ?
+#ifdef CONFIG_SCHED_TUNE
 				(schedtune_prefer_idle(p) > 0) : 0;
-
+#elif  CONFIG_UCLAMP_TASK
+				(uclamp_latency_sensitive(p) > 0) : 0;
+#endif
 		eenv->max_cpu_count = EAS_CPU_BKP + 1;
 
 		fbt_env.is_rtg = is_rtg;
 		fbt_env.placement_boost = placement_boost;
-		fbt_env.start_cpu = start_cpu;
 		fbt_env.boosted = boosted;
 		fbt_env.skip_cpu = is_many_wakeup(sibling_count_hint) ?
 				   cpu : -1;
@@ -8522,10 +8566,9 @@ out:
 	if (target_cpu < 0)
 		target_cpu = prev_cpu;
 
-	trace_sched_task_util(p, next_cpu, backup_cpu, target_cpu, sync,
+	trace_sched_task_util(p, cpu, next_cpu, backup_cpu, target_cpu, sync,
 			fbt_env.need_idle, fbt_env.fastpath, placement_boost,
-			start_t, boosted, is_rtg, get_rtg_status(p),
-			start_cpu);
+			start_t, boosted, is_rtg, get_rtg_status(p));
 	return target_cpu;
 }
 
@@ -8578,7 +8621,12 @@ static inline int wake_energy(struct task_struct *p, int prev_cpu,
 		 * Force prefer-idle tasks into the slow path, this may not happen
 		 * if none of the sd flags matched.
 		 */
-		if (schedtune_prefer_idle(p) > 0 && !sync)
+#ifdef CONFIG_SCHED_TUNE
+		if (schedtune_prefer_idle(p) > 0
+#elif  CONFIG_UCLAMP_TASK
+		if (uclamp_latency_sensitive(p) > 0
+#endif
+				&& !sync)
 			return false;
 	}
 	return true;
