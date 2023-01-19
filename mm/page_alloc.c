@@ -2070,6 +2070,90 @@ static bool can_steal_fallback(unsigned int order, int start_mt, int fallback_ty
 	return false;
 }
 
+static bool boost_eligible(struct zone *z)
+{
+	unsigned long high_wmark, threshold;
+	unsigned long reclaim_eligible, free_pages;
+
+	high_wmark = z->_watermark[WMARK_HIGH];
+	reclaim_eligible = zone_page_state_snapshot(z, NR_ZONE_INACTIVE_FILE) +
+			zone_page_state_snapshot(z, NR_ZONE_ACTIVE_FILE);
+	free_pages = zone_page_state(z, NR_FREE_PAGES) -
+			zone_page_state(z, NR_FREE_CMA_PAGES);
+	threshold = high_wmark + (2 * mult_frac(high_wmark,
+					watermark_boost_factor, 10000));
+
+	/*
+	 * Don't boost watermark If we are already low on memory where the
+	 * boosting can simply put the watermarks at higher levels for a
+	 * longer duration of time and thus the other users relied on the
+	 * watermarks are forced to choose unintended decissions. If memory
+	 * is so low, kswapd in normal mode should help.
+	 */
+
+	if (reclaim_eligible < threshold && free_pages < threshold)
+		return false;
+
+	return true;
+}
+
+#ifndef CONFIG_DYNAMIC_TUNNING_SWAPPINESS
+static inline void boost_watermark(struct zone *zone)
+{
+	unsigned long max_boost;
+
+	if (!watermark_boost_factor || !boost_eligible(zone))
+		return;
+
+	max_boost = mult_frac(zone->_watermark[WMARK_HIGH],
+			watermark_boost_factor, 10000);
+
+	/*
+	 * high watermark may be uninitialised if fragmentation occurs
+	 * very early in boot so do not boost. We do not fall
+	 * through and boost by pageblock_nr_pages as failing
+	 * allocations that early means that reclaim is not going
+	 * to help and it may even be impossible to reclaim the
+	 * boosted watermark resulting in a hang.
+	 */
+	if (!max_boost)
+		return;
+
+	max_boost = max(pageblock_nr_pages, max_boost);
+
+	zone->watermark_boost = min(zone->watermark_boost + pageblock_nr_pages,
+		max_boost);
+}
+#else
+static inline bool boost_watermark(struct zone *zone)
+{
+	unsigned long max_boost;
+
+	if (!watermark_boost_factor || !boost_eligible(zone))
+		return false;
+
+	max_boost = mult_frac(zone->_watermark[WMARK_HIGH],
+			watermark_boost_factor, 10000);
+
+	/*
+	 * high watermark may be uninitialised if fragmentation occurs
+	 * very early in boot so do not boost. We do not fall
+	 * through and boost by pageblock_nr_pages as failing
+	 * allocations that early means that reclaim is not going
+	 * to help and it may even be impossible to reclaim the
+	 * boosted watermark resulting in a hang.
+	 */
+	if (!max_boost)
+		return false;
+
+	max_boost = max(pageblock_nr_pages, max_boost);
+
+	zone->watermark_boost = min(zone->watermark_boost + pageblock_nr_pages,
+		max_boost);
+	return true;
+}
+#endif
+
 /*
  * This function implements actual steal behaviour. If order is large enough,
  * we can steal whole pageblock. If not, we first move freepages in this
@@ -2100,6 +2184,20 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 		change_pageblock_range(page, current_order, start_type);
 		goto single_page;
 	}
+
+	/*
+	 * Boost watermarks to increase reclaim pressure to reduce the
+	 * likelihood of future fallbacks. Wake kswapd now as the node
+	 * may be balanced overall and kswapd will not wake naturally.
+	 */
+#ifndef CONFIG_DYNAMIC_TUNNING_SWAPPINESS
+	boost_watermark(zone);
+	if (alloc_flags & ALLOC_KSWAPD)
+		set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+#else
+	if (boost_watermark(zone) && alloc_flags & ALLOC_KSWAPD)
+		set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+#endif
 
 	/* We are not allowed to try stealing from the whole block */
 	if (!whole_block)
