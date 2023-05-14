@@ -7716,7 +7716,7 @@ static inline void adjust_cpus_for_packing(struct task_struct *p,
 		*best_idle_cpu = -1;
 }
 
-static int get_start_cpu(struct task_struct *p)
+static int __maybe_unused get_start_cpu(struct task_struct *p)
 {
 	struct root_domain *rd = cpu_rq(smp_processor_id())->rd;
 	int start_cpu = rd->min_cap_orig_cpu;
