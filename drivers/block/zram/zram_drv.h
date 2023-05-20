@@ -53,6 +53,13 @@ enum zram_pageflags {
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 
+#ifdef CONFIG_HYBRIDSWAP_CORE
+	ZRAM_BATCHING_OUT,
+	ZRAM_FROM_HYBRIDSWAP,
+	ZRAM_MCGID_CLEAR,
+	ZRAM_IN_BD, /* zram stored in back device */
+#endif
+
 	__NR_ZRAM_PAGEFLAGS,
 };
 
@@ -148,6 +155,12 @@ struct zram {
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
 #endif
+#if (defined CONFIG_ZRAM_WRITEBACK) || (defined CONFIG_HYBRIDSWAP_CORE)
+	struct block_device *bdev;
+	unsigned int old_block_size;
+	unsigned long nr_pages;
+	unsigned long increase_nr_pages;
+#endif
 };
 
 static inline bool zram_dedup_enabled(struct zram *zram)
@@ -158,6 +171,10 @@ static inline bool zram_dedup_enabled(struct zram *zram)
 	return false;
 #endif
 }
+
+#ifdef CONFIG_HYBRIDSWAP_CORE
+	struct hybridswap *hs_swap;
+#endif
 
 void zram_entry_free(struct zram *zram, struct zram_entry *entry);
 #endif
