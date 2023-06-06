@@ -25,15 +25,6 @@ struct fg_info fginfo = {
 
 static struct proc_dir_entry *fg_dir;
 
-bool is_fg(int uid)
-{
-    bool ret = false;
-    if (uid == fginfo.fg_uids)
-	ret = true;
-    return ret;
-}
-EXPORT_SYMBOL_GPL(is_fg);
-
 static int fg_uids_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "fg_uids: %d\n", fginfo.fg_uids);
